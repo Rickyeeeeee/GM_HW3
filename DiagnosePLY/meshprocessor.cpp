@@ -1,5 +1,8 @@
 #include "meshprocessor.h"
 #include "learnply.h"
+#include <unordered_set>
+#include <stack>
+
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -141,7 +144,68 @@ bool MeshProcessor::isNonManifoldVert(Vertex* vert)
 	/// Implement:
 	/// 1. Check if the vertex is a cutting vertex
 	/// 2. Check if the vertex is a dangling vertex
-    return false;
+    std::unordered_map<Vertex*, std::unordered_set<Vertex*>> linkGraph;
+
+    // Step 1: Build the link graph
+    for (Triangle* tri : vert->tris) {
+        // Find the two other vertices in the triangle
+        Vertex* v1 = nullptr;
+        Vertex* v2 = nullptr;
+
+        int found = 0;
+        for (int i = 0; i < 3; ++i) {
+            if (tri->verts[i] != vert) {
+                if (!v1) v1 = tri->verts[i];
+                else v2 = tri->verts[i];
+                if (++found == 2) break;
+            }
+        }
+
+        if (v1 && v2) {
+            // Add undirected edge (v1, v2) in the link graph
+            linkGraph[v1].insert(v2);
+            linkGraph[v2].insert(v1);
+        }
+    }
+
+    // Step 2: Analyze degrees
+    int deg1 = 0, deg2 = 0;
+    std::unordered_set<Vertex*> visited;
+
+    auto start = linkGraph.begin();
+    if (start == linkGraph.end()) return false; // vertex has no neighbors => isolated
+
+    // DFS to count connected component
+    std::stack<Vertex*> stack;
+    stack.push(start->first);
+    visited.insert(start->first);
+
+    while (!stack.empty()) {
+        Vertex* v = stack.top();
+        stack.pop();
+
+        int deg = linkGraph[v].size();
+        if (deg == 1) deg1++;
+        else if (deg == 2) deg2++;
+        else return true; // degree > 2 => branching => non-manifold
+
+        for (Vertex* nbr : linkGraph[v]) {
+            if (!visited.count(nbr)) {
+                visited.insert(nbr);
+                stack.push(nbr);
+            }
+        }
+    }
+
+    // Step 3: Check for single connected component
+    if (visited.size() != linkGraph.size())
+        return true; // disconnected link => non-manifold
+
+    // Step 4: Check degree pattern
+    if ((deg1 == 0 && deg2 == linkGraph.size())) // open path
+        return false; // manifold
+
+    return true; // anything else is non-manifold
 }
 
 /******************************************************************************
@@ -155,10 +219,14 @@ Exit:
 ******************************************************************************/
 bool MeshProcessor::isNonManifoldEdge(Edge* edge)
 {
-    /// Implement:
-    /// 1. Check if the vertex is a cutting edge
-    /// 2. Check if the vertex is a dangling edge (no incident face)
-    return false;
+    int n = edge->ntris();
+
+    // Dangling edge
+    if (n == 0)
+        return true;
+
+    // Manifold if adjacent to 2 (interior) triangles
+    return n != 2;
 }
 
 /******************************************************************************
@@ -179,6 +247,64 @@ bool MeshProcessor::findHoles(Polyhedron* poly, std::vector<std::vector<int>>& h
     /// 2. Connect the marked edges into holes
 	/// 3. Store the edges indices in the vector (i.e., std::vector<int>)
     /// 4. Store the hole in the vector (i.e., std::vector<std::vector<int>>)
+    // Step 1: Identify all boundary edges
+    std::unordered_set<Edge*> boundaryEdges;
+    for (Edge* edge : poly->elist) {
+        if (edge->ntris() == 1) {
+            boundaryEdges.insert(edge);
+        }
+    }
+
+    if (boundaryEdges.empty()) return false;
+
+    // Step 2: Build vertex -> boundary edge mapping for traversal
+    std::unordered_map<Vertex*, std::vector<Edge*>> vertToBoundaryEdges;
+    for (Edge* edge : boundaryEdges) {
+        vertToBoundaryEdges[edge->verts[0]].push_back(edge);
+        vertToBoundaryEdges[edge->verts[1]].push_back(edge);
+    }
+
+    // Step 3: Trace holes
+    std::unordered_set<Edge*> visited;
+    for (Edge* startEdge : boundaryEdges) {
+        if (visited.count(startEdge)) continue;
+
+        std::vector<int> hole;  // Store indices of edges in this hole
+        Edge* currEdge = startEdge;
+        Vertex* currVert = nullptr;
+
+        // Figure out the walking direction
+        // Choose the vertex of the edge that has another boundary edge
+        if (vertToBoundaryEdges[currEdge->verts[0]].size() == 2)
+            currVert = currEdge->verts[1];
+        else
+            currVert = currEdge->verts[0];
+
+        do {
+            hole.push_back(currEdge->index);
+            visited.insert(currEdge);
+
+            // Move to the next edge
+            Vertex* nextVert = (currEdge->verts[0] == currVert) ? currEdge->verts[1] : currEdge->verts[0];
+
+            const std::vector<Edge*>& edges = vertToBoundaryEdges[nextVert];
+            Edge* nextEdge = nullptr;
+
+            for (Edge* e : edges) {
+                if (!visited.count(e) && e != currEdge) {
+                    nextEdge = e;
+                    break;
+                }
+            }
+
+            currVert = nextVert;
+            currEdge = nextEdge;
+
+        } while (currEdge && currEdge != startEdge); // complete the loop
+
+        if (!hole.empty())
+            holes.push_back(hole);
+    }
     return !holes.empty();
 }
 
@@ -198,8 +324,17 @@ void MeshProcessor::calcInteriorAngle(Polyhedron* poly) {
         /// Implement:
 		/// Calculate the interior angle of the corner
         /// Note use tan2
-        double interior_angle = 0.0;
-        ///
+        Eigen::Vector3d v0 = c->prev->vertex->pos;
+        Eigen::Vector3d v1 = c->vertex->pos;
+        Eigen::Vector3d v2 = c->next->vertex->pos;
+
+        Eigen::Vector3d a = v0 - v1;
+        Eigen::Vector3d b = v2 - v1;
+
+        double dotProd = a.dot(b);
+        double crossNorm = (a.cross(b)).norm();
+
+        double interior_angle = std::atan2(crossNorm, dotProd);
         c->interior_angle = interior_angle;
     }
 }
@@ -219,8 +354,27 @@ void MeshProcessor::calcDihedralAngle(Polyhedron* poly) {
         /// Implement:
         /// Calculate the dihedral angle of the corner
         /// Note use tan2
-        double dihedral_angle = 0.0;
-        ///
+        /// 
+        if (e->tris.size() != 2) {
+            // Edge is either on the boundary or non-manifold
+            e->dihedral_angle = 0.0;
+            continue;
+        }
+
+        Triangle* t0 = e->tris[0];
+        Triangle* t1 = e->tris[1];
+
+        Eigen::Vector3d n0 = t0->normal.normalized();
+        Eigen::Vector3d n1 = t1->normal.normalized();
+
+        // Edge direction
+        Eigen::Vector3d edgeVec = (e->verts[1]->pos - e->verts[0]->pos).normalized();
+
+        // Use atan2 for signed angle
+        double sin_theta = edgeVec.dot(n0.cross(n1));
+        double cos_theta = n0.dot(n1);
+        double dihedral_angle = std::atan2(sin_theta, cos_theta);
+
         e->dihedral_angle = dihedral_angle;
     }
 }
@@ -240,7 +394,11 @@ void MeshProcessor::calcVertArea(Polyhedron* poly) {
         /// Implement:
         /// Calculate the vertex area
         double area = 0.0;
-        ///
+        // Accumulate 1/3 of each incident triangle's area
+        for (Triangle* tri : vert_i->tris) {
+            area += tri->area / 3.0;
+        }
+
         vert_i->area = area;
     }
 }
@@ -259,6 +417,16 @@ double MeshProcessor::calcVolume(Polyhedron* poly) {
     /// Calculate the volume
     double volume = 0.0;
     ///
+    for (Triangle* tri : poly->tlist) {
+        Eigen::Vector3d v0 = tri->verts[0]->pos;
+        Eigen::Vector3d v1 = tri->verts[1]->pos;
+        Eigen::Vector3d v2 = tri->verts[2]->pos;
+
+        // Signed volume of tetrahedron formed with origin
+        double vol = (v0.dot(v1.cross(v2))) / 6.0;
+        volume += vol;
+    }
+
     return volume;
 }
 
